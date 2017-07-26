@@ -224,6 +224,28 @@ class Subscription(StripeObject):
         self.amount = 0
 
 
+class SubscriptionItem(StripeObject):
+    subscription = models.ForeignKey(Subscription, related_name="items", on_delete=models.CASCADE)
+    metadata = JSONField(null=True)
+    plan = models.ForeignKey(Plan, on_delete=models.CASCADE)
+    quantity = models.IntegerField()
+
+    @property
+    def stripe_subscription_item(self):
+        return stripe.SubscriptionItem.retrieve(self.subscription.stripe_id)
+
+    @property
+    def total_amount(self):
+        return self.plan.amount * self.quantity
+
+    def plan_display(self):
+        return self.plan.name
+
+    def delete(self, using=None):
+        super(SubscriptionItem, self).delete(using=using)
+        self.quantity = 0
+
+
 class Invoice(StripeObject):
 
     customer = models.ForeignKey(Customer, related_name="invoices", on_delete=models.CASCADE)

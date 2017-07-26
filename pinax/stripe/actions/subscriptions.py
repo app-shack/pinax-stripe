@@ -23,7 +23,12 @@ def cancel(subscription, at_period_end=True):
     sync_subscription_from_stripe_data(subscription.customer, sub)
 
 
-def create(customer, plan, quantity=None, trial_days=None, token=None, coupon=None, tax_percent=None):
+def delete_item(item):
+    sub_item = item.stripe_subscription_item.delete()
+    models.SubscriptionItem.objects.filter(stripe_id=sub_item["id"]).delete()
+
+
+def create(customer, plan, quantity=None, trial_days=None, token=None, coupon=None, tax_percent=None, items=[]):
     """
     Creates a subscription for the given customer
 
@@ -38,6 +43,7 @@ def create(customer, plan, quantity=None, trial_days=None, token=None, coupon=No
                will be used
         coupon: if provided, a coupon to apply towards the subscription
         tax_percent: if provided, add percentage as tax
+        items: if provided, a list of subscription items
 
     Returns:
         the data representing the subscription object that was created
@@ -50,6 +56,8 @@ def create(customer, plan, quantity=None, trial_days=None, token=None, coupon=No
         subscription_params["trial_end"] = datetime.datetime.utcnow() + datetime.timedelta(days=trial_days)
     if token:
         subscription_params["source"] = token
+    if items:
+        subscription_params["items"] = items
 
     subscription_params["plan"] = plan
     subscription_params["quantity"] = quantity
@@ -58,6 +66,23 @@ def create(customer, plan, quantity=None, trial_days=None, token=None, coupon=No
     resp = cu.subscriptions.create(**subscription_params)
 
     return sync_subscription_from_stripe_data(customer, resp)
+
+
+def create_item(subscription, plan, quantity=None, metadata=None):
+    quantity = hooks.hookset.adjust_subscription_quantity(
+        customer=subscription.customer,
+        plan=plan,
+        quantity=quantity,
+    )
+    item_params = {}
+    if metadata:
+        item_params["metadata"] = metadata
+
+    item_params["plan"] = plan
+    item_params["quantity"] = quantity
+
+    resp = subscription.stripe_subscription.items.create(**item_params)
+    return sync_subscription_items(subscription, [resp])[0]
 
 
 def has_active_subscription(customer):
@@ -137,6 +162,16 @@ def retrieve(customer, sub_id):
             raise
 
 
+def retrieve_item(subscription, item_id):
+    if not item_id:
+        return
+    try:
+        return subscription.stripe_subscription.items.retrieve(item_id)
+    except stripe.InvalidRequestError as e:
+        if smart_str(e).find("does not have a subscription with ID") == -1:
+            raise
+
+
 def sync_subscription_from_stripe_data(customer, subscription):
     """
     Syncronizes data from the Stripe API for a subscription
@@ -167,11 +202,35 @@ def sync_subscription_from_stripe_data(customer, subscription):
         stripe_id=subscription["id"],
         defaults=defaults
     )
+
     sub = utils.update_with_defaults(sub, defaults, created)
+    items = subscription.get("items", [])
+    if items:
+        if sync_subscription_items(sub, items.get("data", [])):
+            sub.refresh_from_db()
     return sub
 
 
-def update(subscription, plan=None, quantity=None, prorate=True, coupon=None, charge_immediately=False):
+def sync_subscription_items(subscription, items):
+    ret = []
+    for item in items:
+        plan = models.Plan.objects.get(stripe_id=item["plan"]["id"])
+
+        defaults = dict(
+            plan=plan,
+            metadata=item.get("metadata"),
+            quantity=item["quantity"],
+        )
+        sub_item, created = subscription.items.get_or_create(
+            stripe_id=item["id"],
+            defaults=defaults,
+        )
+        sub_item = utils.update_with_defaults(sub_item, defaults, created)
+        ret.append(sub_item)
+    return ret
+
+
+def update(subscription, plan=None, quantity=None, prorate=True, coupon=None, charge_immediately=False, items=[]):
     """
     Updates a subscription
 
@@ -195,6 +254,26 @@ def update(subscription, plan=None, quantity=None, prorate=True, coupon=None, ch
     if charge_immediately:
         if utils.convert_tstamp(stripe_subscription.trial_end) > timezone.now():
             stripe_subscription.trial_end = 'now'
+    deleted_items = set()
+    if items:
+        deleted_items = {i["id"] for i in items if i.get("deleted", False)}
+        stripe_subscription.items = items
+
     sub = stripe_subscription.save()
     customer = models.Customer.objects.get(pk=subscription.customer.pk)
     sync_subscription_from_stripe_data(customer, sub)
+
+    if deleted_items:
+        subscription.items.filter(stripe_id__in=deleted_items).delete()
+
+
+def update_item(item, plan=None, quantity=None, metadata=None):
+    stripe_subscription_item = item.stripe_subscription_item
+    if plan:
+        stripe_subscription_item.plan = plan
+    if quantity:
+        stripe_subscription_item.quantity = quantity
+    if metadata:
+        stripe_subscription_item.metadata = metadata
+    updated_item = stripe_subscription_item.save()
+    return sync_subscription_items(item.subscription, [updated_item])[0]

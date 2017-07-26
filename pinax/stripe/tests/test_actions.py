@@ -14,7 +14,7 @@ import stripe
 from mock import patch, Mock
 
 from ..actions import charges, customers, events, invoices, plans, refunds, sources, subscriptions, transfers
-from ..models import BitcoinReceiver, Customer, Charge, Card, Plan, Event, Invoice, Subscription, Transfer
+from ..models import BitcoinReceiver, Customer, Charge, Card, Plan, Event, Invoice, Subscription, SubscriptionItem, Transfer
 
 
 class ChargesTests(TestCase):
@@ -662,6 +662,43 @@ class SubscriptionsTests(TestCase):
         self.assertTrue(SubMock.stripe_subscription.save.called)
         self.assertTrue(SyncMock.called)
 
+    @patch("pinax.stripe.actions.subscriptions.sync_subscription_from_stripe_data")
+    def test_update_subscription_items(self, SyncMock):
+        SubMock = Mock()
+        SubMock.customer = self.customer
+        items = [
+            {
+                "id": "sub_item_1",
+                "deleted": False,
+                "metadata": {"some": "data"},
+                "plan": "plan_1",
+                "quantity": 4,
+            }, {
+                "id": "sub_item_2",
+                "deleted": True,
+            }
+        ]
+        subscriptions.update(SubMock, items=items)
+        self.assertEquals(SubMock.stripe_subscription.items, items)
+        self.assertTrue(SubMock.stripe_subscription.save.called)
+        self.assertTrue(SyncMock.called)
+        self.assertTrue(SubMock.items.filter.called)
+        SubMock.items.filter.assert_called_once_with(stripe_id__in={"sub_item_2"})
+
+    @patch("pinax.stripe.actions.subscriptions.sync_subscription_items")
+    def test_update_subscription_item(self, SyncMock):
+        ItemMock = Mock()
+        ItemMock.plan = "abc-plan"
+        ItemMock.quantity = 3
+        ItemMock.metadata = {"some": "thing"}
+
+        subscriptions.update_item(ItemMock, "abc-plan", quantity=3, metadata={"some": "thing"})
+        self.assertEquals(ItemMock.stripe_subscription_item.plan, "abc-plan")
+        self.assertEquals(ItemMock.stripe_subscription_item.quantity, 3)
+        self.assertEquals(ItemMock.stripe_subscription_item.metadata, {"some": "thing"})
+        self.assertTrue(ItemMock.stripe_subscription_item.save.called)
+        self.assertTrue(SyncMock.called)
+
     @patch("stripe.Customer.retrieve")
     @patch("pinax.stripe.actions.subscriptions.sync_subscription_from_stripe_data")
     def test_subscription_create(self, SyncMock, CustomerMock):
@@ -689,6 +726,17 @@ class SubscriptionsTests(TestCase):
         self.assertTrue(SyncMock.called)
         _, kwargs = sub_create.call_args
         self.assertEquals(kwargs["source"], "token")
+
+    @patch("pinax.stripe.actions.subscriptions.sync_subscription_items")
+    def test_subscription_item_create(self, SyncMock):
+        SubMock = Mock()
+        subscriptions.create_item(SubMock, "abc-plan")
+        self.assertTrue(SubMock.stripe_subscription.items.create.called)
+        self.assertTrue(SyncMock.called)
+        SubMock.stripe_subscription.items.create.assert_called_once_with(
+            plan="abc-plan",
+            quantity=4,
+        )
 
     def test_is_period_current(self):
         sub = Subscription(current_period_end=(timezone.now() + datetime.timedelta(days=2)))
@@ -1053,6 +1101,7 @@ class SyncsTests(TestCase):
 
     def test_sync_subscription_from_stripe_data(self):
         Plan.objects.create(stripe_id="pro2", interval="month", interval_count=1, amount=decimal.Decimal("19.99"))
+        Plan.objects.create(stripe_id="items1", interval="month", interval_count=1, amount=decimal.Decimal("9.99"))
         subscription = {
             "id": "sub_7Q4BX0HMfqTpN8",
             "object": "subscription",
@@ -1064,6 +1113,57 @@ class SyncsTests(TestCase):
             "customer": self.customer.stripe_id,
             "discount": None,
             "ended_at": None,
+            "items": {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "si_7Q4BX0HMfqTpN8",
+                        "object": "subscription_item",
+                        "created": 1448121054,
+                        "metadata": {
+                        },
+                        "plan": {
+                            "id": "pro2",
+                            "object": "plan",
+                            "amount": 1999,
+                            "created": 1448121054,
+                            "currency": "usd",
+                            "interval": "month",
+                            "interval_count": 1,
+                            "livemode": False,
+                            "metadata": {},
+                            "name": "The Pro Plan",
+                            "statement_descriptor": "ALTMAN",
+                            "trial_period_days": 3
+                        },
+                        "quantity": 1,
+                    }, {
+                        "id": "si_1AjZzqIkGTE4DaIMmIeoMsC9",
+                        "object": "subscription_item",
+                        "created": 1448121054,
+                        "metadata": {
+                        },
+                        "plan": {
+                            "id": "items1",
+                            "object": "plan",
+                            "amount": 999,
+                            "created": 1448121054,
+                            "currency": "usd",
+                            "interval": "month",
+                            "interval_count": 1,
+                            "livemode": False,
+                            "metadata": {},
+                            "name": "The Items Plan",
+                            "statement_descriptor": "ALTMAN",
+                            "trial_period_days": 10
+                        },
+                        "quantity": 3
+                    },
+                ],
+                "has_more": False,
+                "total_count": 2,
+                "url": "/v1/subscription_items?subscription=sub_7Q4BX0HMfqTpN8"
+            },
             "metadata": {
             },
             "plan": {
@@ -1090,9 +1190,19 @@ class SyncsTests(TestCase):
         }
         subscriptions.sync_subscription_from_stripe_data(self.customer, subscription)
         self.assertEquals(Subscription.objects.get(stripe_id=subscription["id"]).status, "trialing")
+        self.assertEquals(len(SubscriptionItem.objects.all()), 2)
+        self.assertEquals(
+            SubscriptionItem.objects.get(stripe_id="si_1AjZzqIkGTE4DaIMmIeoMsC9").subscription,
+            Subscription.objects.get(stripe_id=subscription["id"])
+        )
+        self.assertEquals(
+            SubscriptionItem.objects.get(stripe_id="si_7Q4BX0HMfqTpN8").subscription,
+            Subscription.objects.get(stripe_id=subscription["id"])
+        )
 
     def test_sync_subscription_from_stripe_data_updated(self):
         Plan.objects.create(stripe_id="pro2", interval="month", interval_count=1, amount=decimal.Decimal("19.99"))
+        Plan.objects.create(stripe_id="items1", interval="month", interval_count=1, amount=decimal.Decimal("9.99"))
         subscription = {
             "id": "sub_7Q4BX0HMfqTpN8",
             "object": "subscription",
@@ -1104,6 +1214,36 @@ class SyncsTests(TestCase):
             "customer": self.customer.stripe_id,
             "discount": None,
             "ended_at": None,
+            "items": {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "si_7Q4BX0HMfqTpN8",
+                        "object": "subscription_item",
+                        "created": 1448121054,
+                        "metadata": {
+                        },
+                        "plan": {
+                            "id": "pro2",
+                            "object": "plan",
+                            "amount": 1999,
+                            "created": 1448121054,
+                            "currency": "usd",
+                            "interval": "month",
+                            "interval_count": 1,
+                            "livemode": False,
+                            "metadata": {},
+                            "name": "The Pro Plan",
+                            "statement_descriptor": "ALTMAN",
+                            "trial_period_days": 3
+                        },
+                        "quantity": 1,
+                    },
+                ],
+                "has_more": False,
+                "total_count": 1,
+                "url": "/v1/subscription_items?subscription=sub_7Q4BX0HMfqTpN8"
+            },
             "metadata": {
             },
             "plan": {
@@ -1130,9 +1270,84 @@ class SyncsTests(TestCase):
         }
         subscriptions.sync_subscription_from_stripe_data(self.customer, subscription)
         self.assertEquals(Subscription.objects.get(stripe_id=subscription["id"]).status, "trialing")
+        self.assertEquals(len(SubscriptionItem.objects.all()), 1)
+        self.assertEquals(
+            SubscriptionItem.objects.get(stripe_id="si_7Q4BX0HMfqTpN8").subscription,
+            Subscription.objects.get(stripe_id=subscription["id"])
+        )
+
         subscription.update({"status": "active"})
+        subscription["items"]["data"].append({
+            "id": "si_1AjZzqIkGTE4DaIMmIeoMsC9",
+            "object": "subscription_item",
+            "created": 1448121054,
+            "plan": {
+                "id": "items1",
+                "object": "plan",
+                "amount": 999,
+                "created": 1448121054,
+                "currency": "usd",
+                "interval": "month",
+                "interval_count": 1,
+                "livemode": False,
+                "metadata": {},
+                "name": "The Items Plan",
+                "statement_descriptor": "ALTMAN",
+                "trial_period_days": 10
+            },
+            "quantity": 3
+        })
+        subscription["items"]["total_count"] = 2
         subscriptions.sync_subscription_from_stripe_data(self.customer, subscription)
         self.assertEquals(Subscription.objects.get(stripe_id=subscription["id"]).status, "active")
+        self.assertEquals(len(SubscriptionItem.objects.all()), 2)
+        self.assertEquals(
+            SubscriptionItem.objects.get(stripe_id="si_1AjZzqIkGTE4DaIMmIeoMsC9").subscription,
+            Subscription.objects.get(stripe_id=subscription["id"])
+        )
+
+    def test_sync_subscription_item_from_stripe_data(self):
+        plan = Plan.objects.create(stripe_id="pro2", interval="month", interval_count=1, amount=decimal.Decimal("19.99"))
+        subscription = Subscription.objects.create(
+            stripe_id="sub_7Q4BX0HMfqTpN8",
+            customer=self.customer,
+            plan=plan,
+            quantity=1,
+            status="active",
+            start=timezone.now()
+        )
+        items = [
+            {
+                "id": "si_7Q4BX0HMfqTpN8",
+                "object": "subscription_item",
+                "created": 1448121054,
+                "plan": {
+                    "id": "pro2",
+                    "object": "plan",
+                    "amount": 1999,
+                    "created": 1448121054,
+                    "currency": "usd",
+                    "interval": "month",
+                    "interval_count": 1,
+                    "livemode": False,
+                    "metadata": {
+                    },
+                    "name": "The Pro Plan",
+                    "statement_descriptor": "ALTMAN",
+                    "trial_period_days": 3
+                },
+                "quantity": 1,
+            },
+        ]
+        resp = subscriptions.sync_subscription_items(subscription, items)
+        self.assertEquals(len(resp), 1)
+        self.assertEquals(SubscriptionItem.objects.get(stripe_id="si_7Q4BX0HMfqTpN8").subscription, subscription)
+        self.assertEquals(SubscriptionItem.objects.get(stripe_id="si_7Q4BX0HMfqTpN8").plan, plan)
+
+        items[0]["quantity"] = 2
+        resp = subscriptions.sync_subscription_items(subscription, items)
+        self.assertEquals(len(resp), 1)
+        self.assertEquals(SubscriptionItem.objects.get(stripe_id="si_7Q4BX0HMfqTpN8").quantity, 2)
 
     @patch("pinax.stripe.actions.subscriptions.sync_subscription_from_stripe_data")
     @patch("pinax.stripe.actions.sources.sync_payment_source_from_stripe_data")
