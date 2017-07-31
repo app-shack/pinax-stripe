@@ -727,13 +727,15 @@ class SubscriptionsTests(TestCase):
         _, kwargs = sub_create.call_args
         self.assertEquals(kwargs["source"], "token")
 
+    @patch("stripe.SubscriptionItem.create")
     @patch("pinax.stripe.actions.subscriptions.sync_subscription_items")
-    def test_subscription_item_create(self, SyncMock):
-        SubMock = Mock()
+    def test_subscription_item_create(self, SyncMock, SubMock):
+        SubMock.stripe_id = "su_abc"
         subscriptions.create_item(SubMock, "abc-plan")
-        self.assertTrue(SubMock.stripe_subscription.items.create.called)
+        self.assertTrue(SubMock.called)
         self.assertTrue(SyncMock.called)
-        SubMock.stripe_subscription.items.create.assert_called_once_with(
+        SubMock.assert_called_once_with(
+            subscription="su_abc",
             plan="abc-plan",
             quantity=4,
         )

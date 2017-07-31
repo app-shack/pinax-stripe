@@ -81,7 +81,11 @@ def create_item(subscription, plan, quantity=None, metadata=None):
     item_params["plan"] = plan
     item_params["quantity"] = quantity
 
-    resp = subscription.stripe_subscription.items.create(**item_params)
+    #resp = subscription.stripe_subscription['items'].create(**item_params)
+    resp = stripe.SubscriptionItem.create(
+        subscription=subscription.stripe_id,
+        **item_params,
+    )
     return sync_subscription_items(subscription, [resp])[0]
 
 
